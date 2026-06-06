@@ -1,0 +1,6 @@
+/dist/
+
+# secrets -- never commit
+.gh-token
+*.token
+*.pat

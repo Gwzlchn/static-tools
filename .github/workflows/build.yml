@@ -1,0 +1,159 @@
+name: build-static
+
+# Adding a tool requires NO change here: the `discover` job scans the repo for
+# <tool>/build.sh (with a `TOOL=` marker) and reads each tool's `ARCHES=` line to
+# build the matrix.
+#
+# Get a new upstream version into Releases with one click:
+#   Actions -> build-static -> Run workflow -> pick tool + version (latest/default/x.y.z)
+#   -> publishes a release tagged "<tool>-<version>" with the static binaries.
+#   (An explicit version requires choosing a single tool, not "all".)
+# Pushing a git tag "v*" instead snapshots every tool at its DEFAULT_VERSION under
+# that tag (note: tmux's default is master HEAD; the exact next-3.7-<rev> is recorded
+# in the asset name and release notes).
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      tool:
+        description: 'Tool to build ("all" or a tool name, e.g. tmux)'
+        default: all
+        type: string
+      version:
+        description: 'Version: latest | default | explicit (e.g. 3.4.1). Explicit needs a single tool.'
+        default: latest
+        type: string
+
+# Serialize runs on the same ref so release create/upload can't race each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # needed to publish releases
+
+jobs:
+  # --- build the {tool, arch} matrix from the repo itself ---------------------
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: gen
+        env:
+          TOOL_FILTER: ${{ github.event.inputs.tool || 'all' }}
+          VERSION_INPUT: ${{ github.event.inputs.version || 'default' }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, re, glob, sys
+          flt = os.environ.get("TOOL_FILTER", "all")
+          ver = os.environ.get("VERSION_INPUT", "default")
+          CANON = {"x86_64", "riscv64"}
+
+          # H2: an explicit version can only target one tool.
+          if ver not in ("", "latest", "default") and flt == "all":
+              sys.exit(f"error: explicit version {ver!r} requires a single tool, not 'all'")
+
+          inc = []
+          for path in sorted(glob.glob("*/build.sh")):
+              tool = os.path.dirname(path)
+              text = open(path, encoding="utf-8").read()
+              if not re.search(r'(?m)^TOOL=', text):     # L4: only real recipes
+                  continue
+              if flt not in ("all", tool):
+                  continue
+              if "-" in tool:                            # H3: keep filename parsing unambiguous
+                  sys.exit(f"error: tool dir name must not contain '-': {tool!r}")
+              m = re.search(r'(?m)^\s*ARCHES=["\']?([^"\'#\n]+)', text)
+              arches = m.group(1).split() if m else ["x86_64"]
+              for a in arches:
+                  if a not in CANON:                     # M2: canonical arch tokens only
+                      sys.exit(f"error: {tool}: unsupported ARCHES token {a!r} (use {sorted(CANON)})")
+                  inc.append({"tool": tool, "arch": a})
+          if not inc:
+              sys.exit(f"error: no tools matched filter {flt!r}")
+          print("matrix=" + json.dumps({"include": inc}))
+          PY
+      - run: echo '${{ steps.gen.outputs.matrix }}'
+
+  # --- build each {tool, arch}; same entrypoint as local -----------------------
+  build:
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+    name: ${{ matrix.tool }}-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build (static, Alpine/musl)
+        env:
+          APK_MIRROR: ""     # CI uses upstream mirrors (CN mirrors are slow off-shore)
+          GNU_MIRROR: ""     # CI uses upstream ftp.gnu.org
+          GOPROXY: ""        # CI -> default proxy.golang.org
+          CARGO_MIRROR: ""   # CI -> default crates.io
+          GH_API_TOKEN: ${{ github.token }}   # authenticate gh_latest_tag (avoid API rate limit)
+        run: ./build.sh ${{ matrix.tool }} ${{ matrix.arch }} "${{ github.event.inputs.version || 'default' }}"
+      - name: Read built version
+        id: ver
+        run: echo "v=$(cat dist/${{ matrix.arch }}/${{ matrix.tool }}.version)" >> "$GITHUB_OUTPUT"
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.tool }}-${{ steps.ver.outputs.v }}-${{ matrix.arch }}
+          path: |
+            dist/${{ matrix.arch }}/${{ matrix.tool }}-*-static
+            dist/${{ matrix.arch }}/${{ matrix.tool }}.version
+          if-no-files-found: error
+
+  # --- publish to Releases (one job, no races) --------------------------------
+  release:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}   # gh needs the repo (no checkout in this job)
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -eu
+          cd artifacts
+          ls -la
+          ls *-static >/dev/null 2>&1 || { echo "no *-static assets found"; exit 1; }
+
+          ensure_release() {   # tag title notesfile
+            if gh release view "$1" >/dev/null 2>&1; then
+              echo "release $1 already exists"
+            else
+              gh release create "$1" --title "$2" --notes-file "$3"
+            fi
+          }
+
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            # One release per tool: tag = <tool>-<version> (read from <tool>.version).
+            for tool in $(for f in *-static; do echo "${f%%-*}"; done | sort -u); do
+              ver=$(tr -d '[:space:]' < "${tool}.version")
+              tag="${tool}-${ver}"
+              printf 'Static (musl) build of %s %s.\n' "$tool" "$ver" > notes.txt
+              ensure_release "$tag" "$tag" notes.txt
+              gh release upload "$tag" ${tool}-*-static --clobber
+              echo "released ${tool} -> $tag"
+            done
+          else
+            tag="$REF_NAME"
+            { echo "Static (musl) builds:"; for f in *-static; do echo "- $f"; done; } > notes.txt
+            ensure_release "$tag" "$tag" notes.txt
+            gh release upload "$tag" *-static --clobber
+          fi
